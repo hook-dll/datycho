@@ -297,13 +297,14 @@ class Wizard:
         rules = ttk.LabelFrame(body, text="Rules")
         rules.pack(fill="x", **pad)
         self.v_start = self._row(rules, "Allowed start (HH:MM)",
-                                 self.cfg["window_start"])
+                                 self.cfg["window_start"], "time")
         self.v_end = self._row(rules, "Allowed end (HH:MM)",
-                               self.cfg["window_end"])
-        self.v_limit = self._row(rules, "Daily limit (minutes)",
-                                 str(self.cfg["daily_limit_minutes"]))
-        self.v_override = self._row(rules, "Override per code (minutes)",
-                                    str(self.cfg["override_grant_minutes"]))
+                               self.cfg["window_end"], "time")
+        self.v_limit = self._row(rules, "Daily limit (1–1440 min)",
+                                 str(self.cfg["daily_limit_minutes"]), "int")
+        self.v_override = self._row(rules, "Override per code (1–1440 min)",
+                                    str(self.cfg["override_grant_minutes"]),
+                                    "int")
         crow = tk.Frame(rules)
         crow.pack(fill="x", padx=8, pady=4)
         tk.Label(crow, text="Timer position", width=26, anchor="w").pack(
@@ -348,13 +349,55 @@ class Wizard:
         self.code_msg = tk.Label(vrow, text="")
         self.code_msg.pack(side="left", padx=6)
 
-    def _row(self, parent, label, value):
+    MAX_MINUTES = 1440  # minutes in a day
+
+    def _row(self, parent, label, value, kind="text"):
         row = tk.Frame(parent)
         row.pack(fill="x", padx=8, pady=4)
         tk.Label(row, text=label, width=26, anchor="w").pack(side="left")
         var = tk.StringVar(value=value)
-        tk.Entry(row, textvariable=var, width=20).pack(side="left")
+        ent = tk.Entry(row, textvariable=var, width=20)
+        if kind == "time":
+            vcmd = (self.root.register(self._vld_time), "%P")
+            ent.config(validate="key", validatecommand=vcmd)
+        elif kind == "int":
+            vcmd = (self.root.register(self._vld_int), "%P")
+            ent.config(validate="key", validatecommand=vcmd)
+        ent.pack(side="left")
         return var
+
+    # ----- live keystroke filters (block obviously-wrong characters) ----- #
+    @staticmethod
+    def _vld_time(proposed):
+        # Allow only digits and a single colon, max "HH:MM".
+        if len(proposed) > 5:
+            return False
+        return all(c.isdigit() or c == ":" for c in proposed) \
+            and proposed.count(":") <= 1
+
+    @staticmethod
+    def _vld_int(proposed):
+        # Allow only up to 4 digits (range is enforced on Install).
+        return proposed == "" or (proposed.isdigit() and len(proposed) <= 4)
+
+    # ----- strict parsing with clear messages ----- #
+    def _parse_time(self, text, name):
+        parts = text.strip().split(":")
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            h, m = int(parts[0]), int(parts[1])
+            if 0 <= h <= 23 and 0 <= m <= 59:
+                return f"{h:02d}:{m:02d}"
+        raise ValueError(
+            f"Enter the {name} time as HH:MM between 00:00 and 23:59 "
+            f"(e.g. 10:00) — got \"{text.strip()}\".")
+
+    def _parse_minutes(self, text, name):
+        t = text.strip()
+        if not t.isdigit() or not (1 <= int(t) <= self.MAX_MINUTES):
+            raise ValueError(
+                f"{name} must be a whole number of minutes from 1 to "
+                f"{self.MAX_MINUTES} (24 hours) — got \"{t}\".")
+        return int(t)
 
     # ----- actions ----- #
     def _update_install_state(self):
@@ -389,13 +432,12 @@ class Wizard:
         cfg = dict(self.cfg)
         cfg["enforced_users"] = [n for n, v in self.user_vars.items()
                                  if v.get()]
-        start, end = self.v_start.get().strip(), self.v_end.get().strip()
-        common.parse_hhmm(start)   # validate (raises ValueError on bad input)
-        common.parse_hhmm(end)
-        cfg["window_start"] = start
-        cfg["window_end"] = end
-        cfg["daily_limit_minutes"] = int(self.v_limit.get())
-        cfg["override_grant_minutes"] = int(self.v_override.get())
+        cfg["window_start"] = self._parse_time(self.v_start.get(), "start")
+        cfg["window_end"] = self._parse_time(self.v_end.get(), "end")
+        cfg["daily_limit_minutes"] = self._parse_minutes(
+            self.v_limit.get(), "Daily limit")
+        cfg["override_grant_minutes"] = self._parse_minutes(
+            self.v_override.get(), "Override length")
         cfg["timer_corner"] = self.v_corner.get()
         return cfg
 
@@ -406,9 +448,8 @@ class Wizard:
             return
         try:
             cfg = self._collect()
-        except ValueError:
-            messagebox.showerror(branding.APP_DISPLAY,
-                                 "Check the times (HH:MM) and numbers.")
+        except ValueError as e:
+            messagebox.showerror(branding.APP_DISPLAY, str(e))
             return
         # The Install button is only enabled with ≥1 account and a verified
         # code, but guard anyway.

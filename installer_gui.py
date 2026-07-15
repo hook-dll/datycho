@@ -1,0 +1,477 @@
+"""
+datychö — GUI setup wizard and uninstaller (Tkinter).
+
+Both run elevated (the packaged exe carries an admin manifest). The wizard lets a
+parent pick which Windows accounts to restrict (accounts with Cyrillic-only
+names are pre-ticked), set the window/limit, enroll an authenticator app via a
+scannable QR, then copies the program to Program Files and installs the service.
+"""
+
+import os
+import sys
+import shutil
+import secrets
+import winreg
+import ctypes
+import subprocess
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+import common
+import branding
+import service
+
+
+# --------------------------------------------------------------------------- #
+# Elevation & environment
+# --------------------------------------------------------------------------- #
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
+def _relaunch_elevated(mode):
+    """Relaunch this program elevated (UAC prompt) in the given mode. Returns
+    True if a relaunch was triggered (caller should exit)."""
+    exe = sys.executable
+    if getattr(sys, "frozen", False):
+        params = mode
+    else:
+        entry = os.path.join(_source_dir(), "datycho.py")
+        params = f'"{entry}" {mode}'
+    # SW_SHOWNORMAL = 1
+    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+    return int(rc) > 32
+
+
+def _is_frozen():
+    return getattr(sys, "frozen", False)
+
+
+def _source_dir():
+    """Folder to copy into Program Files (packaged build only)."""
+    if _is_frozen():
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _installed_exe():
+    return os.path.join(branding.INSTALL_DIR, "datycho.exe")
+
+
+# --------------------------------------------------------------------------- #
+# QR rendering (no image library — draw the matrix on a Canvas)
+# --------------------------------------------------------------------------- #
+def _draw_qr(canvas, uri, cell=5):
+    import qrcode
+    qr = qrcode.QRCode(border=2, box_size=1,
+                       error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(uri)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    n = len(matrix)
+    size = n * cell
+    canvas.config(width=size, height=size)
+    canvas.delete("all")
+    canvas.create_rectangle(0, 0, size, size, fill="white", outline="white")
+    for r, row in enumerate(matrix):
+        for c, on in enumerate(row):
+            if on:
+                x, y = c * cell, r * cell
+                canvas.create_rectangle(x, y, x + cell, y + cell,
+                                        fill="black", outline="black")
+
+
+# --------------------------------------------------------------------------- #
+# Install steps
+# --------------------------------------------------------------------------- #
+def _copy_program_files():
+    src = _source_dir()
+    dst = branding.INSTALL_DIR
+    if os.path.normcase(os.path.abspath(src)) == os.path.normcase(
+            os.path.abspath(dst)):
+        return  # running from the install location already (repair/re-run)
+    os.makedirs(dst, exist_ok=True)
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+
+
+def _register_uninstall():
+    exe = _installed_exe()
+    with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, branding.UNINSTALL_KEY) as k:
+        winreg.SetValueEx(k, "DisplayName", 0, winreg.REG_SZ, branding.APP_DISPLAY)
+        winreg.SetValueEx(k, "DisplayVersion", 0, winreg.REG_SZ, branding.VERSION)
+        winreg.SetValueEx(k, "Publisher", 0, winreg.REG_SZ, branding.PUBLISHER)
+        winreg.SetValueEx(k, "InstallLocation", 0, winreg.REG_SZ,
+                          branding.INSTALL_DIR)
+        winreg.SetValueEx(k, "DisplayIcon", 0, winreg.REG_SZ, exe)
+        winreg.SetValueEx(k, "UninstallString", 0, winreg.REG_SZ,
+                          f'"{exe}" uninstall')
+        winreg.SetValueEx(k, "NoModify", 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(k, "NoRepair", 0, winreg.REG_DWORD, 1)
+
+
+def _remove_uninstall_reg():
+    try:
+        winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE, branding.UNINSTALL_KEY)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _configure_launch(cfg):
+    """Record how the service should start the agent."""
+    if _is_frozen():
+        cfg["app_exe"] = _installed_exe()
+        cfg["python_exe"] = ""
+        cfg["entry_script"] = ""
+    else:
+        pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        cfg["python_exe"] = pyw if os.path.isfile(pyw) else sys.executable
+        cfg["entry_script"] = os.path.join(_source_dir(), "datycho.py")
+        cfg["app_exe"] = ""
+
+
+def perform_install(cfg):
+    """Do the actual install work. Raises if the essential steps (files, config,
+    service) fail. Returns a warning string for any non-essential step."""
+    common.ensure_dirs()
+    if _is_frozen():
+        _copy_program_files()
+    _configure_launch(cfg)
+    common.save_config(cfg)
+    # Start every install from a clean slate: clear any leftover used-time or
+    # active override from a previous install (state.json survives sc delete).
+    common.save_state(common.default_state())
+
+    # (Re)install the service, pointing the SCM at the installed exe so it
+    # survives the flash drive being removed.
+    try:
+        service.remove_service()
+    except Exception:
+        pass
+    if _is_frozen():
+        service.install_service(exe=_installed_exe(),
+                                args=service.SERVICE_RUN_ARG)
+    else:
+        service.install_service()
+    service.start_service()
+
+    # Registering in "Add or remove programs" is best-effort — the service is
+    # already installed and running, so never fail the whole install over it.
+    try:
+        _register_uninstall()
+        return ""
+    except Exception as e:
+        return f"Note: could not add an 'Add or remove programs' entry ({e}). " \
+               "You can still uninstall by running datycho.exe uninstall."
+
+
+# --------------------------------------------------------------------------- #
+# Wizard UI
+# --------------------------------------------------------------------------- #
+class Wizard:
+    CORNERS = ["top-right", "top-left", "top-center",
+               "bottom-right", "bottom-left", "bottom-center"]
+
+    def __init__(self):
+        try:
+            existing = common.load_config()
+        except (OSError, ValueError):
+            existing = common.default_config()
+        self.cfg = existing
+        # A secret is generated up front so the QR matches what gets saved.
+        if not self.cfg.get("totp_secret"):
+            self.cfg["totp_secret"] = common.generate_totp_secret()
+        if not self.cfg.get("ipc_token"):
+            self.cfg["ipc_token"] = secrets.token_hex(16)
+        self.secret = self.cfg["totp_secret"]
+        self.code_ok = False        # a code has been verified this session
+
+        self.root = tk.Tk()
+        self.root.title(f"{branding.APP_DISPLAY} — Setup")
+        self.root.minsize(560, 420)
+        self.user_vars = {}
+        self._build()
+        self._fit_window()
+
+    def _fit_window(self):
+        """Size the window to its content (so nothing is hidden on open),
+        capped to the screen; center it. Scrolling covers the rare overflow."""
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        # Natural height of the scrollable content + fixed header/action bars.
+        content = self.body.winfo_reqheight()
+        chrome = self.header.winfo_reqheight() + self.act.winfo_reqheight() + 48
+        h = min(content + chrome, int(sh * 0.92))
+        w = min(760, int(sw * 0.9))
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 3)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+    # ----- layout ----- #
+    def _make_scrollable(self):
+        """A vertically scrollable content frame, so the window can be any size
+        and all content stays reachable."""
+        container = tk.Frame(self.root)
+        container.pack(fill="both", expand=True)
+        canvas = tk.Canvas(container, highlightthickness=0)
+        vs = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(int(-e.delta / 120),
+                                                      "units"))
+        return inner
+
+    def _build(self):
+        pad = {"padx": 12, "pady": 6}
+
+        # Header (fixed, top).
+        self.header = tk.Label(self.root, text=f"{branding.APP_DISPLAY} setup",
+                               font=("Segoe UI", 16, "bold"))
+        self.header.pack(anchor="w", **pad)
+
+        # Action bar (fixed, bottom) — packed before the scroll area so it is
+        # always visible no matter how small the window is.
+        act = self.act = tk.Frame(self.root)
+        act.pack(fill="x", side="bottom", **pad)
+        self.hint = tk.Label(
+            act, text="Tick an account and verify a code to enable Install.",
+            fg="#666", wraplength=660, justify="left")
+        self.hint.pack(anchor="w")
+        self.status = tk.Label(act, text="", fg="#036", wraplength=660,
+                               justify="left")
+        self.status.pack(anchor="w")
+        self.install_btn = tk.Button(
+            act, text="Install", font=("Segoe UI", 12, "bold"),
+            bg="#2563eb", fg="white", activebackground="#1d4ed8",
+            disabledforeground="#cbd5e1", relief="flat", padx=24, pady=8,
+            cursor="hand2", state="disabled", command=self._install)
+        self.install_btn.pack(anchor="e")
+
+        # Scrollable content (fills the middle).
+        body = self.body = self._make_scrollable()
+
+        if not is_admin():
+            tk.Label(body,
+                     text="⚠ Not running as administrator — install will fail. "
+                          "Right-click the exe and 'Run as administrator'.",
+                     fg="#b00", wraplength=640, justify="left").pack(anchor="w",
+                                                                     **pad)
+
+        # Accounts
+        box = ttk.LabelFrame(body, text="Accounts to restrict "
+                             "(others stay unrestricted)")
+        box.pack(fill="x", **pad)
+        enforced_lower = {u.lower() for u in self.cfg.get("enforced_users", [])}
+        try:
+            users = common.list_local_users()
+        except Exception as e:
+            users = []
+            tk.Label(box, text=f"Could not list accounts: {e}",
+                     fg="#b00").pack(anchor="w", padx=8)
+        if not users:
+            tk.Label(box, text="(no local accounts found)").pack(anchor="w",
+                                                                 padx=8)
+        for name in users:
+            # Nothing is pre-selected; the parent ticks the account(s) to
+            # restrict. On a re-install we restore the previous selection.
+            var = tk.BooleanVar(value=name.lower() in enforced_lower)
+            var.trace_add("write", lambda *a: self._update_install_state())
+            self.user_vars[name] = var
+            tk.Checkbutton(box, text=name, variable=var,
+                           font=("Segoe UI", 11)).pack(anchor="w", padx=8)
+
+        # Rules
+        rules = ttk.LabelFrame(body, text="Rules")
+        rules.pack(fill="x", **pad)
+        self.v_start = self._row(rules, "Allowed start (HH:MM)",
+                                 self.cfg["window_start"])
+        self.v_end = self._row(rules, "Allowed end (HH:MM)",
+                               self.cfg["window_end"])
+        self.v_limit = self._row(rules, "Daily limit (minutes)",
+                                 str(self.cfg["daily_limit_minutes"]))
+        self.v_override = self._row(rules, "Override per code (minutes)",
+                                    str(self.cfg["override_grant_minutes"]))
+        crow = tk.Frame(rules)
+        crow.pack(fill="x", padx=8, pady=4)
+        tk.Label(crow, text="Timer position", width=26, anchor="w").pack(
+            side="left")
+        self.v_corner = tk.StringVar(value=self.cfg.get("timer_corner",
+                                                        "top-right"))
+        ttk.Combobox(crow, textvariable=self.v_corner, values=self.CORNERS,
+                     state="readonly", width=18).pack(side="left")
+
+        # Authenticator
+        auth = ttk.LabelFrame(body, text="Authenticator app (required for overrides)")
+        auth.pack(fill="x", **pad)
+        tk.Label(auth, text="Scan this in Google/Microsoft Authenticator or "
+                 "Authy, or type the key manually, then verify a code below:",
+                 wraplength=640, justify="left").pack(anchor="w", padx=8,
+                                                      pady=(4, 2))
+        qr_wrap = tk.Frame(auth)
+        qr_wrap.pack(anchor="w", padx=8)
+        canvas = tk.Canvas(qr_wrap, highlightthickness=0)
+        canvas.pack(side="left")
+        try:
+            _draw_qr(canvas, common.totp_uri(self.secret))
+        except Exception as e:
+            tk.Label(qr_wrap, text=f"(QR unavailable: {e})", fg="#b00").pack()
+        side = tk.Frame(auth)
+        side.pack(anchor="w", padx=8, pady=4, fill="x")
+        tk.Label(side, text="Key:", font=("Segoe UI", 9)).pack(anchor="w")
+        keyent = tk.Entry(side, font=("Consolas", 10), width=40)
+        keyent.insert(0, self.secret)
+        keyent.config(state="readonly")
+        keyent.pack(anchor="w")
+        vrow = tk.Frame(auth)
+        vrow.pack(anchor="w", padx=8, pady=4)
+        tk.Label(vrow, text="Verify a code:").pack(side="left")
+        self.v_code = tk.StringVar()
+        self.v_code.trace_add("write", lambda *a: self._on_code_change())
+        code_entry = tk.Entry(vrow, textvariable=self.v_code,
+                              font=("Consolas", 12), width=8, justify="center")
+        code_entry.pack(side="left", padx=6)
+        code_entry.bind("<Return>", lambda e: self._check_code())
+        tk.Button(vrow, text="Check", command=self._check_code).pack(side="left")
+        self.code_msg = tk.Label(vrow, text="")
+        self.code_msg.pack(side="left", padx=6)
+
+    def _row(self, parent, label, value):
+        row = tk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=4)
+        tk.Label(row, text=label, width=26, anchor="w").pack(side="left")
+        var = tk.StringVar(value=value)
+        tk.Entry(row, textvariable=var, width=20).pack(side="left")
+        return var
+
+    # ----- actions ----- #
+    def _update_install_state(self):
+        any_acc = any(v.get() for v in self.user_vars.values())
+        ready = any_acc and self.code_ok
+        self.install_btn.config(state="normal" if ready else "disabled")
+        if ready:
+            self.hint.config(text="Ready to install.", fg="#070")
+        elif not any_acc:
+            self.hint.config(text="Tick at least one account to restrict.",
+                             fg="#666")
+        else:
+            self.hint.config(text="Verify a code from your authenticator app.",
+                             fg="#666")
+
+    def _on_code_change(self):
+        # Any edit invalidates a previous verification.
+        self.code_ok = False
+        self.code_msg.config(text="")
+        self._update_install_state()
+
+    def _check_code(self):
+        if common.verify_totp(self.secret, self.v_code.get()):
+            self.code_ok = True
+            self.code_msg.config(text="✓ works", fg="#070")
+        else:
+            self.code_ok = False
+            self.code_msg.config(text="✗ no match", fg="#b00")
+        self._update_install_state()
+
+    def _collect(self):
+        cfg = dict(self.cfg)
+        cfg["enforced_users"] = [n for n, v in self.user_vars.items()
+                                 if v.get()]
+        start, end = self.v_start.get().strip(), self.v_end.get().strip()
+        common.parse_hhmm(start)   # validate (raises ValueError on bad input)
+        common.parse_hhmm(end)
+        cfg["window_start"] = start
+        cfg["window_end"] = end
+        cfg["daily_limit_minutes"] = int(self.v_limit.get())
+        cfg["override_grant_minutes"] = int(self.v_override.get())
+        cfg["timer_corner"] = self.v_corner.get()
+        return cfg
+
+    def _install(self):
+        if not is_admin():
+            messagebox.showerror(branding.APP_DISPLAY,
+                                 "Please run as administrator.")
+            return
+        try:
+            cfg = self._collect()
+        except ValueError:
+            messagebox.showerror(branding.APP_DISPLAY,
+                                 "Check the times (HH:MM) and numbers.")
+            return
+        # The Install button is only enabled with ≥1 account and a verified
+        # code, but guard anyway.
+        if not cfg["enforced_users"] or not self.code_ok:
+            return
+        self.status.config(text="Installing…")
+        self.root.update_idletasks()
+        try:
+            warn = perform_install(cfg)
+        except Exception as e:
+            messagebox.showerror(branding.APP_DISPLAY, f"Install failed:\n{e}")
+            self.status.config(text="Install failed.")
+            return
+        who = ", ".join(cfg["enforced_users"])
+        msg = (f"{branding.APP_DISPLAY} is installed and running.\n\n"
+               f"Applies to: {who}\n"
+               f"Window: {cfg['window_start']}–{cfg['window_end']}\n"
+               f"Limit: {cfg['daily_limit_minutes']} min/day\n\n"
+               "Keep your authenticator app — you'll need a code to grant extra "
+               "time. Remove via 'Add or remove programs'.")
+        if warn:
+            msg += f"\n\n{warn}"
+        messagebox.showinfo(branding.APP_DISPLAY, msg)
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+# --------------------------------------------------------------------------- #
+# Public entry points
+# --------------------------------------------------------------------------- #
+def run_install():
+    if not is_admin():
+        _relaunch_elevated("install")
+        return
+    Wizard().run()
+
+
+def run_uninstall():
+    if not is_admin():
+        _relaunch_elevated("uninstall")
+        return
+    root = tk.Tk()
+    root.withdraw()
+    if not messagebox.askyesno(
+            branding.APP_DISPLAY,
+            f"Remove {branding.APP_DISPLAY} and its settings from this PC?"):
+        return
+    try:
+        service.remove_service()
+    except Exception:
+        pass
+    _remove_uninstall_reg()
+
+    # Kill any running agent and delete the folders after we exit (we may be
+    # running from inside the install folder).
+    targets = f'rmdir /s /q "{branding.INSTALL_DIR}" & rmdir /s /q "{branding.DATA_DIR}"'
+    subprocess.Popen(
+        f'cmd /c ping 127.0.0.1 -n 3 >nul & taskkill /f /im datycho.exe >nul 2>&1 & {targets}',
+        shell=True,
+        creationflags=0x00000008 | 0x00000200,  # DETACHED_PROCESS | NEW_GROUP
+    )
+    messagebox.showinfo(branding.APP_DISPLAY,
+                        f"{branding.APP_DISPLAY} has been removed.")
+    root.destroy()

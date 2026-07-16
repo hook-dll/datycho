@@ -37,7 +37,8 @@ requires a rotating authenticator code to grant extra time. Ships as a single
    *More info → Run anyway*.)
 3. In the wizard:
    - **tick the kid's Windows account(s)**
-   - set the window, daily limit, override length and timer position,
+   - set the window, daily limit, override length, and the timer's position,
+     font size and opacity (a live sample shows the result as you adjust),
    - **scan the QR** with Google/Microsoft Authenticator or Authy (or type the
      key), and click **Check** to confirm a code works,
    - click **Install**.

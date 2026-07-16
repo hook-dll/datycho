@@ -254,6 +254,7 @@ class DatychoService(win32serviceutil.ServiceFramework):
                 "window": f"{cfg['window_start']}–{cfg['window_end']}",
                 "warn_minutes": int(cfg.get("warn_minutes", 10)),
                 "timer_corner": cfg.get("timer_corner", "top-right"),
+                "timer_font_size": int(cfg.get("timer_font_size", 9)),
                 "timer_opacity": float(cfg.get("timer_opacity", 0.65)),
                 "message": message,
             }

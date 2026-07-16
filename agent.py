@@ -80,9 +80,10 @@ class TimerWindow:
         self.win.attributes("-topmost", True)
         self.win.configure(bg="#1c2430")
         self.opacity = 0.65
+        self.font_size = 9
 
         self.label = tk.Label(
-            self.win, text="…", font=("Segoe UI", 9, "bold"),
+            self.win, text="…", font=("Segoe UI", self.font_size, "bold"),
             fg="#e8edf2", bg="#1c2430", padx=8, pady=3,
         )
         self.label.pack()
@@ -96,7 +97,7 @@ class TimerWindow:
 
     def _apply_opacity(self, value):
         try:
-            self.win.attributes("-alpha", max(0.3, min(1.0, float(value))))
+            self.win.attributes("-alpha", max(0.0, min(1.0, float(value))))
         except (tk.TclError, ValueError):
             pass
 
@@ -135,6 +136,10 @@ class TimerWindow:
         if opacity != self.opacity:
             self.opacity = opacity
             self._apply_opacity(opacity)
+        size = int(status.get("timer_font_size", self.font_size) or self.font_size)
+        if size != self.font_size:
+            self.font_size = size
+            self.label.config(font=("Segoe UI", size, "bold"))
         warn = status.get("warn_minutes", 10) * 60
         if status.get("override"):
             rem = status.get("override_remaining", 0)

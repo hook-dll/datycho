@@ -92,7 +92,8 @@ def default_config():
         "entry_script": "",     # datycho.py (source build)
         # UI
         "timer_corner": "top-right",   # top/bottom + right/left/center
-        "timer_opacity": 0.65,         # 0.3 (faint) .. 1.0 (solid)
+        "timer_font_size": 9,          # 4 (tiny) .. 12 (large)
+        "timer_opacity": 0.65,         # 0.0 (invisible) .. 1.0 (solid)
         "warn_minutes": 10,            # timer turns red under this many minutes left
     }
 

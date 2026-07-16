@@ -288,7 +288,7 @@ class Wizard:
             # Nothing is pre-selected; the parent ticks the account(s) to
             # restrict. On a re-install we restore the previous selection.
             var = tk.BooleanVar(value=name.lower() in enforced_lower)
-            var.trace_add("write", lambda *a: self._update_install_state())
+            var.trace_add("write", lambda *a: self._on_accounts_change())
             self.user_vars[name] = var
             tk.Checkbutton(box, text=name, variable=var,
                            font=("Segoe UI", 11)).pack(anchor="w", padx=8)
@@ -311,8 +311,32 @@ class Wizard:
             side="left")
         self.v_corner = tk.StringVar(value=self.cfg.get("timer_corner",
                                                         "top-right"))
-        ttk.Combobox(crow, textvariable=self.v_corner, values=self.CORNERS,
-                     state="readonly", width=18).pack(side="left")
+        corner_cb = ttk.Combobox(crow, textvariable=self.v_corner,
+                                 values=self.CORNERS, state="readonly", width=18)
+        corner_cb.pack(side="left")
+        corner_cb.bind("<<ComboboxSelected>>",
+                       lambda e: self._update_preview())
+
+        # Timer font size (4–12) and opacity (0–100%), shown live in a floating
+        # sample timer that matches the real one, so the parent can dial it in.
+        frow = tk.Frame(rules)
+        frow.pack(fill="x", padx=8, pady=4)
+        tk.Label(frow, text="Timer font size", width=26, anchor="w").pack(
+            side="left")
+        self.v_font = tk.IntVar(value=int(self.cfg.get("timer_font_size", 9)))
+        tk.Scale(frow, from_=4, to=12, orient="horizontal", length=220,
+                 variable=self.v_font,
+                 command=lambda *a: self._update_preview()).pack(side="left")
+
+        orow = tk.Frame(rules)
+        orow.pack(fill="x", padx=8, pady=4)
+        tk.Label(orow, text="Timer opacity (%)", width=26, anchor="w").pack(
+            side="left")
+        self.v_opacity = tk.IntVar(
+            value=int(round(float(self.cfg.get("timer_opacity", 0.65)) * 100)))
+        tk.Scale(orow, from_=0, to=100, orient="horizontal", length=220,
+                 variable=self.v_opacity,
+                 command=lambda *a: self._update_preview()).pack(side="left")
 
         # Authenticator
         auth = ttk.LabelFrame(body, text="Authenticator app (required for overrides)")
@@ -325,10 +349,19 @@ class Wizard:
         qr_wrap.pack(anchor="w", padx=8)
         canvas = tk.Canvas(qr_wrap, highlightthickness=0)
         canvas.pack(side="left")
+        self.qr_canvas = canvas
         try:
-            _draw_qr(canvas, common.totp_uri(self.secret))
+            _draw_qr(canvas, common.totp_uri(self.secret,
+                                             account=self._account_label()))
         except Exception as e:
             tk.Label(qr_wrap, text=f"(QR unavailable: {e})", fg="#b00").pack()
+        # Names the entry in the authenticator app, so multiple installs stay
+        # distinguishable instead of all reading "datychö: parent".
+        self.qr_caption = tk.Label(
+            auth, text="", fg="#036", font=("Segoe UI", 9),
+            wraplength=640, justify="left")
+        self.qr_caption.pack(anchor="w", padx=8)
+        self._update_qr_caption()
         side = tk.Frame(auth)
         side.pack(anchor="w", padx=8, pady=4, fill="x")
         tk.Label(side, text="Key:", font=("Segoe UI", 9)).pack(anchor="w")
@@ -349,7 +382,78 @@ class Wizard:
         self.code_msg = tk.Label(vrow, text="")
         self.code_msg.pack(side="left", padx=6)
 
+        # Floating live sample of the always-on-top timer.
+        self._make_preview()
+        self._update_preview()
+
     MAX_MINUTES = 1440  # minutes in a day
+
+    # ----- authenticator entry naming ----- #
+    def _account_label(self):
+        """The account name shown for this install in the authenticator app.
+
+        Combines the PC name with the restricted account(s) so a parent running
+        datychö on more than one PC (or child) can tell the entries apart,
+        instead of every install reading "datychö: parent"."""
+        host = os.environ.get("COMPUTERNAME") or "PC"
+        users = [n for n, v in self.user_vars.items() if v.get()]
+        if users:
+            return f"{host}: {', '.join(users)}"
+        return host
+
+    def _refresh_qr(self):
+        if not hasattr(self, "qr_canvas"):
+            return
+        try:
+            _draw_qr(self.qr_canvas,
+                     common.totp_uri(self.secret, account=self._account_label()))
+        except Exception:
+            pass
+        self._update_qr_caption()
+
+    def _update_qr_caption(self):
+        if hasattr(self, "qr_caption"):
+            self.qr_caption.config(
+                text=f"In your authenticator app this shows as:  "
+                     f"{branding.APP_DISPLAY}: {self._account_label()}")
+
+    # ----- live timer preview ----- #
+    def _make_preview(self):
+        self.preview = tk.Toplevel(self.root)
+        self.preview.overrideredirect(True)
+        self.preview.attributes("-topmost", True)
+        self.preview.configure(bg="#1c2430")
+        self.preview_label = tk.Label(
+            self.preview, text="⏳ 1:23 left", fg="#e8edf2", bg="#1c2430",
+            padx=8, pady=3)
+        self.preview_label.pack()
+
+    def _update_preview(self):
+        if not hasattr(self, "preview") or not self.preview.winfo_exists():
+            return
+        self.preview_label.config(
+            font=("Segoe UI", int(self.v_font.get()), "bold"))
+        alpha = max(0.0, min(1.0, self.v_opacity.get() / 100.0))
+        try:
+            self.preview.attributes("-alpha", alpha)
+        except tk.TclError:
+            pass
+        self.preview.deiconify()
+        self.preview.update_idletasks()
+        sw = self.preview.winfo_screenwidth()
+        sh = self.preview.winfo_screenheight()
+        w = self.preview.winfo_width()
+        margin = 12
+        positions = {
+            "top-right": (sw - w - margin, margin),
+            "top-left": (margin, margin),
+            "top-center": ((sw - w) // 2, margin),
+            "bottom-right": (sw - w - margin, sh - 60),
+            "bottom-left": (margin, sh - 60),
+            "bottom-center": ((sw - w) // 2, sh - 60),
+        }
+        x, y = positions.get(self.v_corner.get(), positions["top-right"])
+        self.preview.geometry(f"+{int(x)}+{int(y)}")
 
     def _row(self, parent, label, value, kind="text"):
         row = tk.Frame(parent)
@@ -400,6 +504,12 @@ class Wizard:
         return int(t)
 
     # ----- actions ----- #
+    def _on_accounts_change(self):
+        # A changed account selection updates both the Install gate and the
+        # authenticator entry name (which folds in the ticked account(s)).
+        self._update_install_state()
+        self._refresh_qr()
+
     def _update_install_state(self):
         any_acc = any(v.get() for v in self.user_vars.values())
         ready = any_acc and self.code_ok
@@ -439,6 +549,8 @@ class Wizard:
         cfg["override_grant_minutes"] = self._parse_minutes(
             self.v_override.get(), "Override length")
         cfg["timer_corner"] = self.v_corner.get()
+        cfg["timer_font_size"] = int(self.v_font.get())
+        cfg["timer_opacity"] = round(self.v_opacity.get() / 100.0, 3)
         return cfg
 
     def _install(self):
@@ -455,6 +567,8 @@ class Wizard:
         # code, but guard anyway.
         if not cfg["enforced_users"] or not self.code_ok:
             return
+        if hasattr(self, "preview") and self.preview.winfo_exists():
+            self.preview.withdraw()
         self.status.config(text="Installing…")
         self.root.update_idletasks()
         try:

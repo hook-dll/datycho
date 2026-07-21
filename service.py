@@ -120,13 +120,20 @@ class DatychoService(win32serviceutil.ServiceFramework):
         self.state = common.load_state()
         self._roll_day_if_needed()
 
+        self.running = True
+
         ipc_thread = threading.Thread(target=self._ipc_server, daemon=True)
         ipc_thread.start()
+
+        # Keeping the agent alive runs in its own thread so it can wake the
+        # instant the agent process exits (rather than on the 1s tick) and
+        # relaunch with near-zero downtime.
+        supervisor = threading.Thread(target=self._supervisor_loop, daemon=True)
+        supervisor.start()
 
         log.info("Service started; window=%s limit=%smin",
                  self.status.get("window"), self.cfg.get("daily_limit_minutes"))
 
-        self.running = True
         last_persist = time.monotonic()
         last_blocked = None
         tick = 0
@@ -137,7 +144,6 @@ class DatychoService(win32serviceutil.ServiceFramework):
             tick += 1
 
             self._compute_tick()
-            self._supervise_agent()
 
             now = time.monotonic()
             blocked = self.status["blocked"]
@@ -236,14 +242,20 @@ class DatychoService(win32serviceutil.ServiceFramework):
             state["used_seconds"] = used
             remaining = max(0, limit - used)
 
-        # Show the block overlay only when the screen is actively in use
-        # (session present and unlocked) but not allowed. A voluntarily locked
-        # PC shows the normal Windows lock screen — nothing to overlay.
-        blocked = session_active and not is_locked and not allowed
+        # Overlay visibility is deliberately independent of the lock state: the
+        # block overlay stays shown even while the workstation is locked, so on
+        # unlock it is already covering the desktop and there is no brief usable
+        # gap. Time is still not counted while locked (see the counting guard
+        # above), so a voluntary Win+L remains free time.
+        show_block = session_active and monitored and not allowed
+        # "blocked" = actively blocked on a live (unlocked) desktop. Drives the
+        # lock-on-agent-death backstop and the persist-on-change trigger.
+        blocked = show_block and not is_locked
 
         with self.lock:
             self.status = {
                 "blocked": blocked,
+                "show_block": show_block,
                 "reason": reason,
                 "monitored": monitored,
                 "remaining": int(remaining),
@@ -363,18 +375,67 @@ class DatychoService(win32serviceutil.ServiceFramework):
         except Exception:
             return False
 
-    def _supervise_agent(self):
-        sid = common.get_active_console_session()
-        if sid is None:
-            # No interactive user; nothing to supervise.
-            self._close_agent_handle()
-            return
-        if self._agent_alive() and self.agent_session == sid:
-            return
-        # Either the agent is dead, never started, or the console session
-        # changed (fast user switch / re-logon) -> (re)launch it.
-        self._close_agent_handle()
-        self._launch_agent(sid)
+    def _blocked_now(self):
+        """True when a monitored account is actively blocked on a live (unlocked)
+        desktop — i.e. killing the agent right now would expose a usable screen."""
+        with self.lock:
+            return bool(self.status.get("blocked"))
+
+    def _supervisor_loop(self):
+        """Keep the GUI agent alive in the active console session with near-zero
+        downtime.
+
+        Waits on the agent's process handle, so a kill in Task Manager is
+        detected the instant it happens (not on the 1s tick) and the agent is
+        relaunched immediately. If the agent dies while the account is actively
+        blocked, the workstation is locked first, so the child lands on the
+        secure Windows lock screen instead of the briefly-usable desktop that
+        the old poll-based respawn left exposed.
+        """
+        STOP = win32event.WAIT_OBJECT_0
+        while self.running:
+            sid = common.get_active_console_session()
+            if sid is None:
+                # No interactive user (login screen); nothing to supervise.
+                self._close_agent_handle()
+                if win32event.WaitForSingleObject(self.stop_event, 1000) == STOP:
+                    break
+                continue
+
+            if not self._agent_alive() or self.agent_session != sid:
+                # Dead, never started, or the console session changed (fast user
+                # switch / re-logon) -> (re)launch into the current session.
+                self._close_agent_handle()
+                self._launch_agent(sid)
+
+            if self.agent_handle is None:
+                # Launch failed; back off briefly before retrying.
+                if win32event.WaitForSingleObject(self.stop_event, 1000) == STOP:
+                    break
+                continue
+
+            # Wake on: stop requested, the agent process exiting, or 1s elapsing
+            # (so a console-session change is still noticed promptly).
+            rc = win32event.WaitForMultipleObjects(
+                [self.stop_event, self.agent_handle], False, 1000)
+            if rc == STOP:
+                break
+            if rc == STOP + 1:
+                # Agent exited (killed in Task Manager or crashed). If it went
+                # down while blocked, lock the screen before relaunching.
+                if self._blocked_now():
+                    self._lock_session(sid)
+                self._close_agent_handle()
+                # Loop re-runs immediately and relaunches the agent.
+
+    def _agent_alive(self):
+        if self.agent_handle is None:
+            return False
+        try:
+            code = win32process.GetExitCodeProcess(self.agent_handle)
+            return code == win32con.STILL_ACTIVE
+        except Exception:
+            return False
 
     def _close_agent_handle(self):
         if self.agent_handle is not None:
@@ -385,12 +446,9 @@ class DatychoService(win32serviceutil.ServiceFramework):
             self.agent_handle = None
             self.agent_session = None
 
-    def _agent_command(self, cfg):
-        """Build the command line that launches the GUI agent, for either the
-        packaged (frozen exe) or the from-source layout."""
-        port = int(cfg.get("ipc_port", 47615))
-        token = cfg.get("ipc_token", "")
-        tail = f'agent --port {port} --token {token}'
+    def _app_command(self, cfg, tail):
+        """Command line that runs the app with `tail` (e.g. 'agent ...' or
+        'lock'), for either the packaged (frozen exe) or from-source layout."""
         app_exe = cfg.get("app_exe") or ""
         if app_exe and os.path.isfile(app_exe):
             return f'"{app_exe}" {tail}'
@@ -401,22 +459,24 @@ class DatychoService(win32serviceutil.ServiceFramework):
             return f'"{python_exe}" "{entry}" {tail}'
         return None
 
-    def _launch_agent(self, sid):
-        with self.lock:
-            cfg = dict(self.cfg)
-        cmd = self._agent_command(cfg)
-        if not cmd:
-            log.error("Cannot launch agent; no valid app_exe/python_exe in config")
-            return
-        try:
-            # Get the token of the logged-on user in that session and start the
-            # agent as that user, on their interactive desktop.
-            user_token = win32ts.WTSQueryUserToken(sid)
-            dup = win32security.DuplicateTokenEx(
-                user_token, win32security.SecurityImpersonation,
-                win32con.MAXIMUM_ALLOWED, win32security.TokenPrimary)
-            win32api.CloseHandle(user_token)
+    def _agent_command(self, cfg):
+        port = int(cfg.get("ipc_port", 47615))
+        token = cfg.get("ipc_token", "")
+        return self._app_command(cfg, f'agent --port {port} --token {token}')
 
+    def _lock_command(self, cfg):
+        return self._app_command(cfg, "lock")
+
+    def _run_in_session(self, sid, cmd):
+        """Start `cmd` as the user logged into console session `sid`, on their
+        interactive desktop. Returns (process_handle, pid); the caller owns the
+        handle. Raises on failure."""
+        user_token = win32ts.WTSQueryUserToken(sid)
+        dup = win32security.DuplicateTokenEx(
+            user_token, win32security.SecurityImpersonation,
+            win32con.MAXIMUM_ALLOWED, win32security.TokenPrimary)
+        win32api.CloseHandle(user_token)
+        try:
             env = win32profile.CreateEnvironmentBlock(dup, False)
 
             startup = win32process.STARTUPINFO()
@@ -430,13 +490,41 @@ class DatychoService(win32serviceutil.ServiceFramework):
             hProcess, hThread, pid, tid = win32process.CreateProcessAsUser(
                 dup, None, cmd, None, None, False, flags, env, None, startup)
             win32api.CloseHandle(hThread)
+            return hProcess, pid
+        finally:
             win32api.CloseHandle(dup)
 
-            self.agent_handle = hProcess
-            self.agent_session = sid
-            log.info("Launched agent pid=%s in session %s", pid, sid)
+    def _launch_agent(self, sid):
+        with self.lock:
+            cfg = dict(self.cfg)
+        cmd = self._agent_command(cfg)
+        if not cmd:
+            log.error("Cannot launch agent; no valid app_exe/python_exe in config")
+            return
+        try:
+            hProcess, pid = self._run_in_session(sid, cmd)
         except Exception:
             log.exception("Failed to launch agent in session %s", sid)
+            return
+        self.agent_handle = hProcess
+        self.agent_session = sid
+        log.info("Launched agent pid=%s in session %s", pid, sid)
+
+    def _lock_session(self, sid):
+        """Lock the interactive session (secure Windows lock screen) by running
+        a one-shot 'lock' helper as the logged-on user."""
+        with self.lock:
+            cfg = dict(self.cfg)
+        cmd = self._lock_command(cfg)
+        if not cmd:
+            log.error("Cannot lock session; no valid app_exe/python_exe in config")
+            return
+        try:
+            hProcess, pid = self._run_in_session(sid, cmd)
+            win32api.CloseHandle(hProcess)
+            log.info("Locked session %s (agent went down while blocked)", sid)
+        except Exception:
+            log.exception("Failed to lock session %s", sid)
 
 
 # --------------------------------------------------------------------------- #

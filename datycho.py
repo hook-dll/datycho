@@ -4,6 +4,7 @@ datychö — single entry point for every mode.
 Usage (packaged datycho.exe or `python datycho.py`):
     datycho.exe                 -> GUI setup wizard (default; needs admin)
     datycho.exe agent ...       -> GUI agent in the user session (spawned by service)
+    datycho.exe lock            -> lock the session and exit (spawned by service)
     datycho.exe uninstall       -> GUI uninstaller (needs admin)
     datycho.exe --service-run   -> service host (launched by the Windows SCM)
 
@@ -36,6 +37,14 @@ def main():
     if mode == "agent":
         import agent
         agent.main(args[1:])
+        return
+
+    if mode == "lock":
+        # One-shot: lock the interactive session (same secure lock screen as
+        # Win+L), then exit. Launched by the service into the user session as a
+        # backstop when the agent is killed while the account is blocked.
+        import ctypes
+        ctypes.WinDLL("user32", use_last_error=True).LockWorkStation()
         return
 
     if mode == "uninstall":

@@ -273,7 +273,10 @@ class App:
             else:
                 # Unmonitored account (e.g. a parent's): no timer, no overlay.
                 self.timer.hide()
-            if status.get("blocked"):
+            # `show_block` keeps the overlay up even while the workstation is
+            # locked, so on unlock it is already covering the desktop (no usable
+            # gap). Falls back to `blocked` for older service builds.
+            if status.get("show_block", status.get("blocked")):
                 self.overlay.show(status)
             else:
                 self.overlay.hide()

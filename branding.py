@@ -19,7 +19,7 @@ SERVICE_DESCRIPTION = (
     "the screen when out of time."
 )
 PUBLISHER = "datychö"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # Locations.
 PROGRAMDATA = os.environ.get("ProgramData", r"C:\ProgramData")

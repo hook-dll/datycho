@@ -14,8 +14,10 @@ requires a rotating authenticator code to grant extra time. Ships as a single
 - **Block screen** when out of time; entering the current 6-digit code from your Google
   authenticator app grants a temporary override. The code rotates every 30s, so
   there's no static password for a child to learn.
-- Runs as a **LocalSystem Windows service** a non-admin child can't kill, and
-  **relaunches the timer/overlay within ~1s** if it's closed.
+- Runs as a **LocalSystem Windows service** a non-admin child can't kill. It
+  **relaunches the timer/overlay instantly** if it's closed, and if the overlay
+  is killed while out of time the service **locks the screen** so there's no
+  usable gap.
 - **Cyrillic account names** are fully supported (read, matched, displayed).
 
 
@@ -94,9 +96,12 @@ shared secret is stored, in `C:\ProgramData\datycho\config.json`.
 - **Unsigned exe** → SmartScreen/antivirus may warn; code signing needs a paid
   certificate (not included).
 - The "can't be killed" guarantee is about the **service** (needs admin to stop).
-  The overlay is a normal top-most window the service respawns quickly; there's a
-  ~1s gap on each kill, and it doesn't hard-block all keyboard input. Sufficient
-  for a young, non-technical child.
+  The overlay is a normal top-most window, but it stays shown *through* a lock
+  (so returning from Win+L shows the block with no usable gap), the service
+  respawns it the instant it's killed, and a kill while out of time triggers a
+  screen lock. It still doesn't intercept every keystroke (e.g. Win-key
+  shortcuts) — the lock screen is the real backstop. Sufficient for a young,
+  non-technical child.
 - An **administrator** account can always stop the service — keep the child on a
   standard account.
 - Override friction is intentional: each extension needs a fresh code from your

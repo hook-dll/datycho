@@ -1,6 +1,6 @@
 # datychö
 
-Screen-time control for a Windows 11 PC. Intended use: restrict your kid from using PC too much. 
+Screen-time control for a Windows 10/11 PC. Intended use: restrict your kid from using PC too much. 
 
 Enforces a daily time window and a daily usage limit for chosen Windows accounts, blocks the screen when time is up, and
 requires a rotating authenticator code to grant extra time. Ships as a single
@@ -33,7 +33,7 @@ requires a rotating authenticator code to grant extra time. Ships as a single
 
 ### Install
 
-1. Download and open **`datychö-Setup`** folder.
+1. Download Datycho from releases on the right of this page, unzip it and open **`datychö-Setup`** folder.
 2. Run **`datycho.exe`**. Approve the
    **UAC / administrator** prompt. (This is an unsigned app: so if SmartScreen warns, choose
    *More info → Run anyway*.)

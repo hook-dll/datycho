@@ -1,0 +1,42 @@
+name: release
+
+# Build the PyInstaller bundle on a Windows runner and attach it to the GitHub
+# release for the pushed tag (there is no Python toolchain on the dev machine).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build
+        run: python build.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $zip = "datycho-Setup-$env:GITHUB_REF_NAME.zip"
+          Compress-Archive -Path "dist/datychö-Setup" -DestinationPath $zip -Force
+          "ASSET=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          name: datychö ${{ github.ref_name }}
+          generate_release_notes: true

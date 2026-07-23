@@ -305,6 +305,17 @@ class Wizard:
         self.v_override = self._row(rules, "Override per code (1–1440 min)",
                                     str(self.cfg["override_grant_minutes"]),
                                     "int")
+        # Pin this PC's current UTC offset so a child changing the Windows time
+        # zone (a non-admin action) can't shift the window or roll the day. The
+        # value is captured at install in _collect; here we just show it.
+        _off = common.current_utc_offset_minutes()
+        tk.Label(rules,
+                 text=(f"🕒 Time zone locked to {common.fmt_utc_offset(_off)} "
+                       "(this PC). Changing the Windows time zone or clock no "
+                       "longer adds time — a wrong clock blocks until a parent "
+                       "enters a code."),
+                 fg="#036", wraplength=520, justify="left").pack(
+                     anchor="w", padx=8, pady=(2, 6))
         crow = tk.Frame(rules)
         crow.pack(fill="x", padx=8, pady=4)
         tk.Label(crow, text="Timer position", width=26, anchor="w").pack(
@@ -551,6 +562,9 @@ class Wizard:
         cfg["timer_corner"] = self.v_corner.get()
         cfg["timer_font_size"] = int(self.v_font.get())
         cfg["timer_opacity"] = round(self.v_opacity.get() / 100.0, 3)
+        # Pin the offset as of install; enforcement uses it instead of the live
+        # (child-changeable) OS time zone.
+        cfg["utc_offset_minutes"] = common.current_utc_offset_minutes()
         return cfg
 
     def _install(self):

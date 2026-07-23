@@ -58,6 +58,11 @@ def main():
         # Normal (asInvoker) manifest — the installer self-elevates via UAC, so
         # the agent can still run as the standard-user child without a prompt.
         "--hidden-import", "win32timezone",
+        # Trusted-time sync uses these stdlib modules (imported lazily, so make
+        # sure PyInstaller bundles them and OpenSSL for ssl).
+        "--hidden-import", "ssl",
+        "--hidden-import", "http.client",
+        "--hidden-import", "email.utils",
         "--collect-submodules", "qrcode",
         "datycho.py",
     ]

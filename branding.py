@@ -19,7 +19,12 @@ SERVICE_DESCRIPTION = (
     "the screen when out of time."
 )
 PUBLISHER = "datychö"
-VERSION = "1.1.1"
+VERSION = "1.2.0"
+
+# Absolute "past floor" for anti-tamper: any clock earlier than this is
+# impossible (the software did not exist yet), so it is treated as tampered.
+# Bump this on each release to at/just-before build time. 2026-07-01 00:00 UTC.
+BUILD_EPOCH = 1782864000
 
 # Locations.
 PROGRAMDATA = os.environ.get("ProgramData", r"C:\ProgramData")

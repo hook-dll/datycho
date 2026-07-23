@@ -17,7 +17,7 @@ import logging
 import logging.handlers
 import ctypes
 from ctypes import wintypes
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone, timedelta
 
 import branding
 
@@ -31,6 +31,13 @@ LOG_DIR = branding.LOG_DIR
 
 # Directory containing this source tree (service.py / agent.py live here too).
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Trusted-time sources (see the "Trusted time / anti-tamper" section). HTTPS
+# hosts are queried for their TLS-authenticated Date header; NTP hosts are a
+# faster, lower-trust fallback.
+DEFAULT_TIME_SYNC_HOSTS = ["www.google.com", "www.cloudflare.com",
+                           "www.microsoft.com"]
+DEFAULT_NTP_HOSTS = ["pool.ntp.org", "time.windows.com", "time.google.com"]
 
 
 # --------------------------------------------------------------------------- #
@@ -95,6 +102,21 @@ def default_config():
         "timer_font_size": 9,          # 4 (tiny) .. 12 (large)
         "timer_opacity": 0.65,         # 0.0 (invisible) .. 1.0 (solid)
         "warn_minutes": 10,            # timer turns red under this many minutes left
+        # Anti-clock-tampering. The window and daily limit are decided against a
+        # UTC epoch shifted by this fixed offset (minutes east of UTC), pinned at
+        # install, instead of the live OS time zone — so a child changing the
+        # Windows time zone (a non-admin action) cannot move the window or roll
+        # the day. None means "not pinned yet; fall back to the OS offset".
+        "utc_offset_minutes": None,
+        # Trusted-time sources queried by the service (LocalSystem, so it has
+        # network access even when the child account is restricted). HTTPS Date
+        # headers are TLS-validated and hard to spoof without admin; NTP is a
+        # faster fallback used only when HTTPS is unreachable.
+        "time_sync_hosts": DEFAULT_TIME_SYNC_HOSTS,
+        "time_sync_ntp": DEFAULT_NTP_HOSTS,
+        # How far the OS clock may disagree with trusted time before the session
+        # is treated as tampered (seconds).
+        "time_tamper_threshold_seconds": 90,
     }
 
 
@@ -119,7 +141,17 @@ def save_config(cfg):
 # Daily state (usage + active override)
 # --------------------------------------------------------------------------- #
 def default_state():
-    return {"date": "", "used_seconds": 0, "override_until": 0.0}
+    return {
+        "date": "", "used_seconds": 0, "override_until": 0.0,
+        # Anti-tamper anchors (see the trusted-time section below).
+        # High-water mark of the highest trusted epoch ever seen: a later OS
+        # clock that is *below* this is a rollback.
+        "max_trusted_epoch": 0.0,
+        # Calendar date (pinned-offset local) that trusted time last confirmed.
+        "last_trusted_date": "",
+        # Last known-good trusted epoch, persisted to survive reboots.
+        "trusted_anchor_epoch": 0.0,
+    }
 
 
 def load_state():
@@ -238,6 +270,179 @@ def fmt_hms(seconds):
     if h:
         return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
+
+
+# --------------------------------------------------------------------------- #
+# Trusted time / anti-tamper
+#
+# The service decides the window and the daily reset against *trusted* time, not
+# the raw OS clock, so a child cannot earn time by changing the date, the time,
+# or (with no admin) the Windows time zone. See service.py for the loop that
+# holds the anchor and applies these helpers.
+# --------------------------------------------------------------------------- #
+def current_utc_offset_minutes():
+    """The OS's current local UTC offset in minutes east of UTC. Spoofable by a
+    time-zone change, so only used to *pin* the offset at install (and as a
+    fallback before a pin exists), never as a live authority."""
+    off = datetime.now().astimezone().utcoffset()
+    return int(off.total_seconds() // 60) if off else 0
+
+
+def effective_offset_minutes(cfg):
+    """The pinned offset if set, else the live OS offset (pre-pin fallback)."""
+    off = cfg.get("utc_offset_minutes")
+    if off is None:
+        return current_utc_offset_minutes()
+    return int(off)
+
+
+def fmt_utc_offset(minutes):
+    sign = "+" if minutes >= 0 else "-"
+    m = abs(int(minutes))
+    return f"UTC{sign}{m // 60:02d}:{m % 60:02d}"
+
+
+def _local_dt_from_epoch(epoch, offset_minutes):
+    return (datetime.fromtimestamp(epoch, tz=timezone.utc)
+            + timedelta(minutes=offset_minutes))
+
+
+def local_date_from_epoch(epoch, offset_minutes):
+    """YYYY-MM-DD of a UTC epoch shifted by a fixed offset — the day identity,
+    independent of the OS time zone."""
+    return _local_dt_from_epoch(epoch, offset_minutes).strftime("%Y-%m-%d")
+
+
+def local_time_from_epoch(epoch, offset_minutes):
+    """Wall-clock time-of-day of a UTC epoch shifted by a fixed offset, for the
+    window check — independent of the OS time zone."""
+    return _local_dt_from_epoch(epoch, offset_minutes).time()
+
+
+def detect_tamper(os_epoch, trusted_epoch, max_trusted_epoch, build_epoch,
+                  have_anchor, threshold=90, rollback_skew=120,
+                  forward_grace=30 * 3600):
+    """Decide whether the OS clock should be distrusted. Pure — every input is
+    supplied so it is fully unit-testable without touching the real clock.
+
+    Returns (suspect: bool, reason: str). Reasons:
+      before_build        OS clock predates the build (impossible).
+      rollback            OS clock is below the trusted high-water mark.
+      divergence          OS clock disagrees with a live trusted anchor.
+      unconfirmed_forward offline, OS clock jumped implausibly far ahead of the
+                          high-water mark with no anchor to confirm it.
+    """
+    if os_epoch < build_epoch - rollback_skew:
+        return True, "before_build"
+    if max_trusted_epoch and os_epoch < max_trusted_epoch - rollback_skew:
+        return True, "rollback"
+    if have_anchor and trusted_epoch is not None:
+        if abs(os_epoch - trusted_epoch) > threshold:
+            return True, "divergence"
+        return False, ""
+    # No live anchor (offline). Accept a plausible forward drift from the
+    # high-water mark (a normal power-off), but flag a big unconfirmed jump.
+    if max_trusted_epoch and os_epoch > max_trusted_epoch + forward_grace:
+        return True, "unconfirmed_forward"
+    return False, ""
+
+
+class TimeAuthority:
+    """Holds the trusted-time anchor and answers "what time is it really?".
+
+    An anchor is a (trusted_epoch, monotonic) pair captured at a successful
+    network sync. `trusted_now()` extrapolates it with `time.monotonic()`, which
+    no clock change can move. With no anchor (e.g. offline since boot) it returns
+    None and callers fall back to the OS clock, guarded by `detect_tamper`."""
+
+    def __init__(self):
+        self._anchor_epoch = None
+        self._anchor_mono = None
+
+    def set_anchor(self, trusted_epoch, mono=None):
+        self._anchor_epoch = float(trusted_epoch)
+        self._anchor_mono = time.monotonic() if mono is None else mono
+
+    @property
+    def have_anchor(self):
+        return self._anchor_epoch is not None
+
+    def trusted_now(self, mono=None):
+        if self._anchor_epoch is None:
+            return None
+        m = time.monotonic() if mono is None else mono
+        return self._anchor_epoch + (m - self._anchor_mono)
+
+
+def fetch_https_epoch(hosts, timeout=6):
+    """Median epoch from the TLS-validated Date header of several HTTPS hosts.
+    Returns a float epoch, or None if none answered. Spoofing this requires a
+    trusted certificate, which a non-admin user cannot install."""
+    import ssl
+    import http.client
+    from email.utils import parsedate_to_datetime
+    ctx = ssl.create_default_context()
+    got = []
+    for host in hosts:
+        conn = None
+        try:
+            conn = http.client.HTTPSConnection(host, timeout=timeout, context=ctx)
+            conn.request("HEAD", "/")
+            resp = conn.getresponse()
+            date = resp.getheader("Date")
+            if date:
+                got.append(parsedate_to_datetime(date).timestamp())
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    if not got:
+        return None
+    got.sort()
+    return got[len(got) // 2]
+
+
+def fetch_ntp_epoch(hosts, timeout=5):
+    """Epoch from the first SNTP host that answers, or None. Unauthenticated, so
+    lower trust than HTTPS — used only as a fallback."""
+    import socket as _socket
+    NTP_DELTA = 2208988800  # seconds between 1900-01-01 and 1970-01-01
+    packet = b"\x1b" + 47 * b"\0"
+    for host in hosts:
+        s = None
+        try:
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            s.settimeout(timeout)
+            s.sendto(packet, (host, 123))
+            data, _ = s.recvfrom(48)
+            if len(data) >= 44:
+                secs = struct.unpack("!I", data[40:44])[0]
+                return float(secs - NTP_DELTA)
+        except Exception:
+            continue
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    return None
+
+
+def fetch_trusted_epoch(cfg):
+    """Best trusted epoch available: HTTPS (authenticated) first, then NTP.
+    Returns (epoch, source) or (None, "")."""
+    epoch = fetch_https_epoch(cfg.get("time_sync_hosts") or DEFAULT_TIME_SYNC_HOSTS)
+    if epoch is not None:
+        return epoch, "https"
+    epoch = fetch_ntp_epoch(cfg.get("time_sync_ntp") or DEFAULT_NTP_HOSTS)
+    if epoch is not None:
+        return epoch, "ntp"
+    return None, ""
 
 
 # --------------------------------------------------------------------------- #

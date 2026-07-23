@@ -38,6 +38,12 @@ TICK_SECONDS = 1
 PERSIST_EVERY = 15          # seconds between routine state writes
 CONFIG_RELOAD_EVERY = 10    # ticks between config reloads
 
+# Trusted-time sync cadence and tamper thresholds (seconds).
+SYNC_INTERVAL = 600         # routine re-sync of the trusted anchor
+SYNC_RETRY = 60             # faster retry while we have no anchor / after a drift
+DRIFT_TRIGGER = 90          # unexplained OS-clock jump between ticks -> re-sync
+RECHECK_GRACE = 25          # give a triggered re-sync this long before blocking
+
 # Marker argument the SCM uses to launch this exe in service mode.
 SERVICE_RUN_ARG = "--service-run"
 
@@ -79,6 +85,17 @@ class DatychoService(win32serviceutil.ServiceFramework):
         # (WTS_SESSION_LOCK/UNLOCK). Time while locked is not counted.
         self.session_locked = False
 
+        # Trusted-time authority + the background sync thread's wake event.
+        # The whole enforcement path decides against trusted time, not the raw
+        # OS clock, so clock/date/time-zone changes can never grant free time.
+        self.time_auth = common.TimeAuthority()
+        # Manual-reset event: set to make the sync thread re-fetch immediately.
+        self._resync_event = win32event.CreateEvent(None, 1, 0, None)
+        self._last_os_epoch = None      # OS clock at the previous tick
+        self._last_mono = None          # monotonic clock at the previous tick
+        self._recheck_until = 0.0       # monotonic deadline suppressing a
+        #                                 divergence block while a re-sync runs
+
     # ----- service control ------------------------------------------------- #
     def GetAcceptedControls(self):
         # Also receive lock/unlock (and logon/logoff) session notifications.
@@ -118,12 +135,18 @@ class DatychoService(win32serviceutil.ServiceFramework):
         common.ensure_dirs()
         self._reload_config()
         self.state = common.load_state()
-        self._roll_day_if_needed()
+        # The day-roll is now trusted-time gated and happens inside the tick
+        # loop; no OS-clock reset at startup (that was the exploitable path).
 
         self.running = True
 
         ipc_thread = threading.Thread(target=self._ipc_server, daemon=True)
         ipc_thread.start()
+
+        # Trusted-time sync runs in its own thread so a fetch (which may block on
+        # the network) never stalls enforcement.
+        sync_thread = threading.Thread(target=self._time_sync_loop, daemon=True)
+        sync_thread.start()
 
         # Keeping the agent alive runs in its own thread so it can wake the
         # instant the agent process exits (rather than on the 1s tick) and
@@ -168,23 +191,74 @@ class DatychoService(win32serviceutil.ServiceFramework):
         except (OSError, ValueError) as e:
             log.warning("Could not load config (%s); using defaults", e)
 
-    def _roll_day_if_needed(self):
-        today = common.today_str()
-        if self.state.get("date") != today:
-            self.state["date"] = today
-            self.state["used_seconds"] = 0
-            self.state["override_until"] = 0.0
+    def _maybe_roll_day(self, eff_epoch, offset, suspect, have_anchor, os_epoch):
+        """Reset the daily counter when a genuine new day begins — gated on
+        trusted time so a clock/date change can never trigger a free reset.
+
+        * suspect clock -> never roll (fail-closed; the counter stays frozen).
+        * trusted anchor present -> the trusted date is authoritative.
+        * offline -> only a *forward* date change is honoured, and only within
+          the plausible power-off window vetted by detect_tamper; the confirmed
+          `last_trusted_date` is left untouched so the next sync re-checks it.
+        """
+        if suspect:
+            return
+        state = self.state
+        eff_date = common.local_date_from_epoch(eff_epoch, offset)
+        cur = state.get("date", "")
+        if eff_date == cur:
+            return
+        if have_anchor or not cur or eff_date > cur:
+            state["date"] = eff_date
+            state["used_seconds"] = 0
+            state["override_until"] = 0.0
+            state["max_trusted_epoch"] = max(
+                float(state.get("max_trusted_epoch", 0)), eff_epoch, os_epoch)
+            if have_anchor:
+                state["last_trusted_date"] = eff_date
+                state["trusted_anchor_epoch"] = eff_epoch
 
     def _compute_tick(self):
         with self.lock:
             cfg = dict(self.cfg)
             state = self.state
 
-        self._roll_day_if_needed()
+        os_epoch = time.time()
+        mono = time.monotonic()
+        offset = common.effective_offset_minutes(cfg)
 
-        from datetime import datetime
-        now = datetime.now()
-        now_epoch = time.time()
+        # Trusted time is authoritative; fall back to the OS clock only when we
+        # have no anchor (offline since boot), guarded by detect_tamper below.
+        trusted = self.time_auth.trusted_now(mono)
+        have_anchor = self.time_auth.have_anchor
+        eff_epoch = trusted if (have_anchor and trusted is not None) else os_epoch
+
+        # An unexplained OS-clock jump between ticks (live date/time change *or* a
+        # wake-from-sleep) triggers an immediate re-sync; a divergence block is
+        # held off briefly so the fresh anchor can settle before we judge.
+        if self._last_os_epoch is not None and self._last_mono is not None:
+            expected = self._last_os_epoch + (mono - self._last_mono)
+            if abs(os_epoch - expected) > DRIFT_TRIGGER:
+                self._request_resync(mono)
+        self._last_os_epoch = os_epoch
+        self._last_mono = mono
+
+        max_trusted = float(state.get("max_trusted_epoch", 0))
+        suspect, suspect_reason = common.detect_tamper(
+            os_epoch, trusted, max_trusted, branding.BUILD_EPOCH, have_anchor,
+            threshold=int(cfg.get("time_tamper_threshold_seconds", 90)))
+        if suspect_reason == "divergence" and self._recheck_until and \
+                mono < self._recheck_until:
+            suspect, suspect_reason = False, ""  # let the pending re-sync settle
+
+        # Advance the persisted high-water mark / anchor from trusted time.
+        if have_anchor and trusted is not None and not suspect:
+            state["max_trusted_epoch"] = max(max_trusted, trusted)
+            state["trusted_anchor_epoch"] = trusted
+            state["last_trusted_date"] = common.local_date_from_epoch(
+                trusted, offset)
+
+        self._maybe_roll_day(eff_epoch, offset, suspect, have_anchor, os_epoch)
 
         try:
             start = common.parse_hhmm(cfg["window_start"])
@@ -196,8 +270,8 @@ class DatychoService(win32serviceutil.ServiceFramework):
         limit = int(cfg["daily_limit_minutes"]) * 60
         used = int(state["used_seconds"])
         override_until = float(state.get("override_until", 0))
-        override_active = now_epoch < override_until
-        override_remaining = int(max(0, override_until - now_epoch)) \
+        override_active = eff_epoch < override_until
+        override_remaining = int(max(0, override_until - eff_epoch)) \
             if override_active else 0
 
         sid = common.get_active_console_session()
@@ -213,13 +287,21 @@ class DatychoService(win32serviceutil.ServiceFramework):
         # spent locked (Win+L, afk) is not counted.
         is_locked = self.session_locked
 
-        within = common.in_window(now.time(), start, end)
+        within = common.in_window(
+            common.local_time_from_epoch(eff_epoch, offset), start, end)
         remaining = max(0, limit - used)
 
         if not monitored:
             # This account isn't subject to the rules (e.g. a parent's login).
             allowed, reason = True, "unmonitored"
             message = ""
+        elif suspect:
+            # Fail-closed: the clock can't be trusted, so block rather than let a
+            # date/time change buy free time. A parent code clears it, and it
+            # clears itself once trusted time confirms the clock.
+            allowed, reason = False, "time_suspect"
+            message = ("The clock looks wrong or was changed. Ask a parent for "
+                       "a code. This clears once the time is confirmed online.")
         elif override_active:
             allowed, reason = True, "override"
             message = "Parent override active"
@@ -263,6 +345,8 @@ class DatychoService(win32serviceutil.ServiceFramework):
                 "limit": int(limit),
                 "override": override_active and monitored,
                 "override_remaining": override_remaining,
+                "time_suspect": bool(suspect),
+                "suspect_reason": suspect_reason,
                 "window": f"{cfg['window_start']}–{cfg['window_end']}",
                 "warn_minutes": int(cfg.get("warn_minutes", 10)),
                 "timer_corner": cfg.get("timer_corner", "top-right"),
@@ -281,11 +365,24 @@ class DatychoService(win32serviceutil.ServiceFramework):
     def _grant_override(self, code):
         with self.lock:
             cfg = dict(self.cfg)
-        if not common.verify_totp(cfg.get("totp_secret"), code):
+        secret = cfg.get("totp_secret")
+        os_epoch = time.time()
+        trusted = self.time_auth.trusted_now()
+        # The parent's authenticator uses real time. Accept a match against the
+        # OS clock (correct when untampered) OR trusted time (correct via the
+        # monotonic anchor when the OS clock has been changed) — so a parent can
+        # always clear a tamper block regardless of which clock is off.
+        ok = common.verify_totp(secret, code, ts=os_epoch)
+        if not ok and trusted is not None:
+            ok = common.verify_totp(secret, code, ts=trusted)
+        if not ok:
             log.info("Override attempt with incorrect/expired code")
             return False
         grant = int(cfg.get("override_grant_minutes", 60)) * 60
-        self.state["override_until"] = time.time() + grant
+        # Anchor the expiry to the same time base the tick uses (trusted when
+        # available) so a clock change can neither extend nor cut it short.
+        base = trusted if trusted is not None else os_epoch
+        self.state["override_until"] = base + grant
         self._persist()
         log.info("Parent override granted for %s minutes",
                  cfg.get("override_grant_minutes"))
@@ -296,6 +393,51 @@ class DatychoService(win32serviceutil.ServiceFramework):
         self.state["override_until"] = 0.0
         self._persist()
         log.info("Override ended by parent (re-lock)")
+
+    # ----- trusted-time sync ---------------------------------------------- #
+    def _request_resync(self, mono=None):
+        """Ask the sync thread to re-fetch trusted time now, and suppress a
+        divergence block for a short grace so the fresh anchor can settle."""
+        if mono is None:
+            mono = time.monotonic()
+        self._recheck_until = mono + RECHECK_GRACE
+        win32event.SetEvent(self._resync_event)
+
+    def _time_sync_loop(self):
+        """Periodically anchor trusted time from the network (see common.
+        fetch_trusted_epoch). Runs as LocalSystem, so it reaches the network even
+        when the child account is restricted. Sleeps on the stop event and a
+        resync event, so it also fires immediately on a detected clock jump."""
+        STOP = win32event.WAIT_OBJECT_0
+        while self.running:
+            with self.lock:
+                cfg = dict(self.cfg)
+            try:
+                epoch, src = common.fetch_trusted_epoch(cfg)
+            except Exception:
+                log.exception("Trusted-time fetch crashed")
+                epoch, src = None, ""
+
+            if epoch is not None:
+                self.time_auth.set_anchor(epoch)
+                with self.lock:
+                    self.state["trusted_anchor_epoch"] = epoch
+                    self.state["max_trusted_epoch"] = max(
+                        float(self.state.get("max_trusted_epoch", 0)), epoch)
+                self._recheck_until = 0.0
+                log.info("Trusted time synced via %s", src)
+                wait_ms = SYNC_INTERVAL * 1000
+            else:
+                log.warning("Trusted-time sync failed (offline?); "
+                            "using offline anti-tamper heuristics")
+                wait_ms = SYNC_RETRY * 1000
+
+            rc = win32event.WaitForMultipleObjects(
+                [self.stop_event, self._resync_event], False, wait_ms)
+            if rc == STOP:
+                break
+            # Woken by a resync request: clear it and loop to fetch immediately.
+            win32event.ResetEvent(self._resync_event)
 
     # ----- IPC server ------------------------------------------------------ #
     def _ipc_server(self):

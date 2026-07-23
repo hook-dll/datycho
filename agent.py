@@ -205,6 +205,7 @@ class BlockOverlay:
         headline = {
             "outside_window": "Not computer time",
             "limit_reached": "Time's up for today",
+            "time_suspect": "Clock problem",
         }.get(status.get("reason"), "Locked")
         self.headline.config(text=headline)
         self.detail.config(text=status.get("message", ""))
